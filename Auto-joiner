@@ -26,6 +26,55 @@ local RunService = game:GetService("RunService")
 
 local LocalPlayer = Players.LocalPlayer
 
+-- Notifier Configuration for Discord Webhooks
+-- IMPORTANT: Use HttpService:RequestAsync (NOT PostAsync) to send custom headers
+local Notifier = {
+    Enabled = true, -- Set to true to enable Discord notifications
+    Url = "https://steal-a-brainrot-auto-joiner.onrender.com/data",
+    SecretToken = "1dafeb4470e7ad9d8f72f7ad1fb49fae" -- Must match SECRET_TOKEN in server .env
+}
+
+-- Function to send notification to Discord via Node server
+local function sendNotification(brainrots, jobId, placeId)
+    if not Notifier.Enabled or not Notifier.Url or Notifier.Url == "" then 
+        return 
+    end
+    
+    -- Prepare payload with brainrot data
+    local payload = {
+        jobId = jobId or game.JobId,
+        placeId = placeId or tostring(game.PlaceId),
+        brainrots = {}
+    }
+    
+    -- Format brainrots array
+    for _, brainrot in ipairs(brainrots) do
+        table.insert(payload.brainrots, {
+            name = brainrot.name,
+            value = brainrot.value
+        })
+    end
+    
+    -- Send request using RequestAsync (supports custom headers)
+    local success, response = pcall(function()
+        return HttpService:RequestAsync({
+            Url = Notifier.Url,
+            Method = "POST",
+            Headers = {
+                ["Content-Type"] = "application/json",
+                ["Authorization"] = Notifier.SecretToken
+            },
+            Body = HttpService:JSONEncode(payload)
+        })
+    end)
+    
+    if success and response.Success then
+        print("[Notifier] Successfully sent to Discord:", response.Body)
+    else
+        warn("[Notifier] Failed to send notification:", response)
+    end
+end
+
 -- Configuration
 local Config = {
     MinimumIncome = 100000000, -- 100M/s default
@@ -59,6 +108,8 @@ local ESPLoopTask = nil -- Store ESP task for cleanup
 local TARGET_HITBOX_SIZE = Vector3.new(0.01, 0.01, 0.01) -- Constant for comparison
 local CurrentESPTarget = nil -- Track current ESP target to avoid flickering
 local BrainrotValueCache = {} -- Persistent cache for brainrot values
+local LastNotificationTime = {} -- Track last notification time per player (UserId -> timestamp)
+local NOTIFICATION_COOLDOWN = 300 -- Seconds (5 minutes) between notifications for same player
 
 -- Helper Functions
 local function formatNumber(num)
@@ -248,6 +299,33 @@ local function updateESP()
             
             -- Notify about the best brainrot
             createNotification("ESP", "Targeting: " .. brainrot.name .. " ($" .. formatNumber(brainrot.value) .. ")", 3)
+            
+            -- Send Discord notification if high-value and cooldown expired
+            if Notifier.Enabled and brainrot.value >= Config.MinimumIncome then
+                local currentTime = os.time()
+                local userId = tostring(brainrot.player.UserId)
+                local lastNotifyTime = LastNotificationTime[userId] or 0
+                
+                -- Only notify if cooldown has expired
+                if currentTime - lastNotifyTime >= NOTIFICATION_COOLDOWN then
+                    LastNotificationTime[userId] = currentTime
+                    
+                    -- Send all high-value brainrots in current server
+                    local highValueBrainrots = {}
+                    for _, br in ipairs(brainrots) do
+                        if br.value >= 1000000 then -- At least 1M
+                            table.insert(highValueBrainrots, {
+                                name = br.name,
+                                value = br.value
+                            })
+                        end
+                    end
+                    
+                    if #highValueBrainrots > 0 then
+                        sendNotification(highValueBrainrots, game.JobId, tostring(game.PlaceId))
+                    end
+                end
+            end
         end
     else
         -- No brainrots found, clear ESP
@@ -1461,6 +1539,16 @@ local function scanServers()
             local bestServer = ServerList[1]
             local brainrotInfo = #bestServer.brainrots > 0 and " with " .. table.concat(bestServer.brainrots, ", ") or ""
             createNotification("Auto-Joiner", "Found server: " .. formatNumber(bestServer.income) .. "/s" .. brainrotInfo, 4)
+            
+            -- NOTE: Discord notifications should be sent when actual brainrot values are detected
+            -- in the current server (e.g., in findBrainrotsInWorkspace or updateESP), not during
+            -- scanning which uses simulated/placeholder data. Example:
+            -- 
+            -- local realBrainrots = findBrainrotsInWorkspace()
+            -- if #realBrainrots > 0 then
+            --     sendNotification(realBrainrots, game.JobId, tostring(game.PlaceId))
+            -- end
+            
             task.wait(2)
             joinServer(bestServer.jobId)
         end
