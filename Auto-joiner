@@ -32,19 +32,33 @@ local Config = {
     Enabled = false,
     ScanInterval = 30, -- seconds between server scans
     PlaceId = 109983668079237, -- Official Sammy's Steal a Brainrot (Place ID for teleporting)
+    UseServerPlaceId = true, -- Always use server's placeId when teleporting
     UniverseId = nil, -- Will be fetched automatically from Place ID
     UniverseIdErrorShown = false, -- Track if error notification was shown
     MaxServersToScan = 50,
     UIExpanded = false,
     ESPEnabled = true,
     AutoGrabEnabled = false, -- Auto-grab Brainrots feature
-    HitboxRemoverEnabled = false, -- Hitbox remover feature
+    HitboxRemoverEnabled = false, -- Hitbox remover feature (DEPRECATED - use AntiHit instead)
     GrabInterval = 5, -- seconds between grab attempts
     TeleportWaitTime = 0.5, -- seconds to wait after teleportation
     HitboxMaintenanceInterval = 0.5, -- seconds between hitbox maintenance checks
     -- Brainrot value estimation range (placeholder - real game would need actual value detection)
     BrainrotMinValue = 1000,
-    BrainrotMaxValue = 10000000
+    BrainrotMaxValue = 10000000,
+    -- Notifier configuration
+    Notifier = {
+        Url = "", -- Set to your notifier server URL (e.g., "https://your-app.onrender.com/data")
+        Secret = "" -- Optional: Set to your SECRET_TOKEN if using authentication
+    },
+    -- Safe Anti-Hit (Auto-Dodge) configuration
+    AntiHit = {
+        Enabled = false,
+        Radius = 12, -- Detection radius for nearby players
+        Step = 6, -- Distance to move when dodging
+        Cooldown = 0.6, -- Cooldown between dodges
+        Randomize = true -- Randomize dodge direction
+    }
 }
 
 -- UI State
@@ -59,6 +73,10 @@ local ESPLoopTask = nil -- Store ESP task for cleanup
 local TARGET_HITBOX_SIZE = Vector3.new(0.01, 0.01, 0.01) -- Constant for comparison
 local CurrentESPTarget = nil -- Track current ESP target to avoid flickering
 local BrainrotValueCache = {} -- Persistent cache for brainrot values
+local AntiHitConnection = nil -- Store Anti-Hit connection for cleanup
+local LastDodgeTime = 0 -- Track last dodge time for cooldown
+local NotifierDedup = {} -- Notifier deduplication cache
+local NOTIFIER_DEDUP_TIME = 30 -- 30 seconds deduplication
 
 -- Helper Functions
 local function formatNumber(num)
@@ -498,6 +516,190 @@ local function maintainHitboxRemoval()
     end)
 end
 
+-- Notifier Functions
+local function sendNotifier(brainrots)
+    if not Config.Notifier.Url or Config.Notifier.Url == "" then
+        return -- Notifier not configured
+    end
+    
+    if not brainrots or #brainrots == 0 then
+        return -- No brainrots to send
+    end
+    
+    -- Sort brainrots by value
+    table.sort(brainrots, function(a, b) return a.value > b.value end)
+    
+    -- Get top brainrot for deduplication key
+    local topBrainrot = brainrots[1]
+    -- Use pipe delimiter to prevent collision issues
+    local dedupKey = game.JobId .. "|" .. topBrainrot.name .. "|" .. tostring(topBrainrot.value)
+    
+    -- Check deduplication
+    local currentTime = os.clock()
+    if NotifierDedup[dedupKey] and (currentTime - NotifierDedup[dedupKey] < NOTIFIER_DEDUP_TIME) then
+        return -- Already sent recently
+    end
+    
+    -- Truncate to 25 entries
+    local truncatedBrainrots = {}
+    for i = 1, math.min(#brainrots, 25) do
+        table.insert(truncatedBrainrots, {
+            name = brainrots[i].name,
+            value = brainrots[i].value
+        })
+    end
+    
+    -- Prepare payload
+    local payload = {
+        placeId = Config.PlaceId,
+        jobId = game.JobId,
+        brainrots = truncatedBrainrots
+    }
+    
+    -- Send request
+    local success, err = pcall(function()
+        local headers = {
+            ["Content-Type"] = "application/json"
+        }
+        
+        -- Add authentication header if secret is set
+        if Config.Notifier.Secret and Config.Notifier.Secret ~= "" then
+            headers["x-notifier-token"] = Config.Notifier.Secret
+        end
+        
+        HttpService:RequestAsync({
+            Url = Config.Notifier.Url,
+            Method = "POST",
+            Headers = headers,
+            Body = HttpService:JSONEncode(payload)
+        })
+    end)
+    
+    if success then
+        -- Update deduplication cache
+        NotifierDedup[dedupKey] = currentTime
+        createNotification("Notifier", "Sent " .. #truncatedBrainrots .. " brainrot(s) to server", 2)
+    else
+        warn("Failed to send notifier request:", err)
+    end
+end
+
+-- Safe Anti-Hit (Auto-Dodge) Functions
+local function isPlayerFacingMe(otherPlayer)
+    if not LocalPlayer.Character or not otherPlayer.Character then
+        return false
+    end
+    
+    local myRoot = LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    local theirRoot = otherPlayer.Character:FindFirstChild("HumanoidRootPart")
+    
+    if not myRoot or not theirRoot then
+        return false
+    end
+    
+    -- Check if they're facing towards me
+    local toMe = (myRoot.Position - theirRoot.Position).Unit
+    local theirLook = theirRoot.CFrame.LookVector
+    local dotProduct = toMe:Dot(theirLook)
+    
+    -- If dot product > 0.5, they're roughly facing me (within ~60 degrees)
+    return dotProduct > 0.5
+end
+
+local function hasToolEquipped(player)
+    if not player.Character then
+        return false
+    end
+    
+    -- Check if player has a tool equipped
+    local tool = player.Character:FindFirstChildOfClass("Tool")
+    return tool ~= nil
+end
+
+local function performDodge()
+    if not LocalPlayer.Character then
+        return false
+    end
+    
+    local humanoid = LocalPlayer.Character:FindFirstChild("Humanoid")
+    local root = LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    
+    if not humanoid or not root or humanoid.Health <= 0 then
+        return false
+    end
+    
+    -- Calculate dodge direction
+    local dodgeDirection
+    if Config.AntiHit.Randomize then
+        -- Random lateral direction
+        local angle = math.random() * math.pi * 2
+        dodgeDirection = Vector3.new(math.cos(angle), 0, math.sin(angle))
+    else
+        -- Dodge to the right
+        dodgeDirection = root.CFrame.RightVector
+    end
+    
+    -- Calculate dodge position
+    local dodgePosition = root.Position + (dodgeDirection * Config.AntiHit.Step)
+    
+    -- Perform dodge using Humanoid:MoveTo for safe movement
+    local success = pcall(function()
+        humanoid:MoveTo(dodgePosition)
+    end)
+    
+    return success
+end
+
+local function startAntiHit()
+    if AntiHitConnection then
+        return -- Already running
+    end
+    
+    AntiHitConnection = RunService.Heartbeat:Connect(function()
+        if not Config.AntiHit.Enabled then
+            return
+        end
+        
+        local currentTime = os.clock()
+        if currentTime - LastDodgeTime < Config.AntiHit.Cooldown then
+            return -- Cooldown active
+        end
+        
+        if not LocalPlayer.Character or not LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+            return
+        end
+        
+        local myRoot = LocalPlayer.Character.HumanoidRootPart
+        
+        -- Check for nearby threatening players
+        for _, player in pairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer and player.Character then
+                local theirRoot = player.Character:FindFirstChild("HumanoidRootPart")
+                
+                if theirRoot then
+                    local distance = (myRoot.Position - theirRoot.Position).Magnitude
+                    
+                    -- If player is within radius, has a tool, and is facing me
+                    if distance <= Config.AntiHit.Radius and hasToolEquipped(player) and isPlayerFacingMe(player) then
+                        -- Perform dodge
+                        if performDodge() then
+                            LastDodgeTime = currentTime
+                            break -- Only dodge once per frame
+                        end
+                    end
+                end
+            end
+        end
+    end)
+end
+
+local function stopAntiHit()
+    if AntiHitConnection then
+        AntiHitConnection:Disconnect()
+        AntiHitConnection = nil
+    end
+end
+
 -- Create UI
 local function createUI()
     -- Main ScreenGui
@@ -660,10 +862,13 @@ local function createUI()
     contentContainer.Parent = mainFrame
 
     -- Dashboard Tab Content
-    local dashboardContent = Instance.new("Frame")
+    local dashboardContent = Instance.new("ScrollingFrame")
     dashboardContent.Name = "DashboardContent"
     dashboardContent.Size = UDim2.new(1, 0, 1, 0)
     dashboardContent.BackgroundTransparency = 1
+    dashboardContent.BorderSizePixel = 0
+    dashboardContent.ScrollBarThickness = 4
+    dashboardContent.CanvasSize = UDim2.new(0, 0, 0, 350) -- Set canvas size for scrolling
     dashboardContent.Visible = true
     dashboardContent.Parent = contentContainer
     UIElements.TabContents.Dashboard = dashboardContent
@@ -854,6 +1059,50 @@ local function createUI()
     local hitboxButtonCorner = Instance.new("UICorner")
     hitboxButtonCorner.CornerRadius = UDim.new(0, 6) -- Reduced from 8
     hitboxButtonCorner.Parent = hitboxButton
+
+    -- Safe Anti-Hit Feature Card - SMALLER FOR MOBILE
+    local antiHitCard = Instance.new("Frame")
+    antiHitCard.Size = UDim2.new(1, 0, 0, 60) -- Same size as other cards
+    antiHitCard.Position = UDim2.new(0, 0, 0, 285) -- Position after hitbox card
+    antiHitCard.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+    antiHitCard.BorderSizePixel = 0
+    antiHitCard.Parent = dashboardContent
+    
+    local antiHitCorner = Instance.new("UICorner")
+    antiHitCorner.CornerRadius = UDim.new(0, 8)
+    antiHitCorner.Parent = antiHitCard
+    
+    local antiHitStroke = Instance.new("UIStroke")
+    antiHitStroke.Color = Color3.fromRGB(255, 100, 255) -- Pink/magenta color
+    antiHitStroke.Thickness = 1.5
+    antiHitStroke.Parent = antiHitCard
+    
+    local antiHitTitle = Instance.new("TextLabel")
+    antiHitTitle.Size = UDim2.new(1, -16, 0, 18)
+    antiHitTitle.Position = UDim2.new(0, 8, 0, 4)
+    antiHitTitle.BackgroundTransparency = 1
+    antiHitTitle.Text = "⚡ Safe Anti-Hit (Auto-Dodge)"
+    antiHitTitle.TextColor3 = Color3.fromRGB(255, 100, 255)
+    antiHitTitle.TextSize = 10
+    antiHitTitle.Font = Enum.Font.GothamBold
+    antiHitTitle.TextXAlignment = Enum.TextXAlignment.Left
+    antiHitTitle.Parent = antiHitCard
+    
+    local antiHitButton = Instance.new("TextButton")
+    antiHitButton.Size = UDim2.new(0, 130, 0, 26)
+    antiHitButton.Position = UDim2.new(0, 8, 0, 28)
+    antiHitButton.BackgroundColor3 = Color3.fromRGB(200, 100, 200)
+    antiHitButton.Text = "🔴 Enable Anti-Hit"
+    antiHitButton.TextColor3 = Color3.fromRGB(0, 0, 0)
+    antiHitButton.TextSize = 9
+    antiHitButton.Font = Enum.Font.GothamBold
+    antiHitButton.BorderSizePixel = 0
+    antiHitButton.Parent = antiHitCard
+    UIElements.AntiHitButton = antiHitButton
+    
+    local antiHitButtonCorner = Instance.new("UICorner")
+    antiHitButtonCorner.CornerRadius = UDim.new(0, 6)
+    antiHitButtonCorner.Parent = antiHitButton
 
     -- Settings Tab Content
     local settingsContent = Instance.new("Frame")
@@ -1160,8 +1409,8 @@ local function updateServerListDisplay()
         incomeLabel.Size = UDim2.new(1, -20, 0, 16)
         incomeLabel.Position = UDim2.new(0, 10, 0, 25)
         incomeLabel.BackgroundTransparency = 1
-        incomeLabel.Text = "💰 Income: " .. formatNumber(server.income) .. "/s"
-        incomeLabel.TextColor3 = Color3.fromRGB(50, 205, 50)
+        incomeLabel.Text = "💰 Income: N/A/s"
+        incomeLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
         incomeLabel.TextSize = 12
         incomeLabel.Font = Enum.Font.Gotham
         incomeLabel.TextXAlignment = Enum.TextXAlignment.Left
@@ -1178,24 +1427,17 @@ local function updateServerListDisplay()
         playersLabel.TextXAlignment = Enum.TextXAlignment.Left
         playersLabel.Parent = serverCard
 
-        -- Display Brainrots on the server
-        local brainrotLabel = Instance.new("TextLabel")
-        brainrotLabel.Size = UDim2.new(1, -20, 0, 16)
-        brainrotLabel.Position = UDim2.new(0, 10, 0, 61)
-        brainrotLabel.BackgroundTransparency = 1
-        local brainrotText = "🧠 Brainrots: "
-        if server.brainrots and #server.brainrots > 0 then
-            brainrotText = brainrotText .. table.concat(server.brainrots, ", ")
-        else
-            brainrotText = brainrotText .. "None"
-        end
-        brainrotLabel.Text = brainrotText
-        brainrotLabel.TextColor3 = Color3.fromRGB(255, 165, 0)
-        brainrotLabel.TextSize = 11
-        brainrotLabel.Font = Enum.Font.Gotham
-        brainrotLabel.TextXAlignment = Enum.TextXAlignment.Left
-        brainrotLabel.TextTruncate = Enum.TextTruncate.AtEnd
-        brainrotLabel.Parent = serverCard
+        -- Display PlaceId on the server card
+        local placeIdLabel = Instance.new("TextLabel")
+        placeIdLabel.Size = UDim2.new(1, -20, 0, 16)
+        placeIdLabel.Position = UDim2.new(0, 10, 0, 61)
+        placeIdLabel.BackgroundTransparency = 1
+        placeIdLabel.Text = "🎮 PlaceId: " .. (server.placeId or Config.PlaceId)
+        placeIdLabel.TextColor3 = Color3.fromRGB(138, 43, 226)
+        placeIdLabel.TextSize = 10
+        placeIdLabel.Font = Enum.Font.Gotham
+        placeIdLabel.TextXAlignment = Enum.TextXAlignment.Left
+        placeIdLabel.Parent = serverCard
 
         local joinButton = Instance.new("TextButton")
         joinButton.Size = UDim2.new(0, 70, 0, 22)
@@ -1213,7 +1455,7 @@ local function updateServerListDisplay()
         joinCorner.Parent = joinButton
 
         joinButton.MouseButton1Click:Connect(function()
-            joinServer(server.jobId)
+            joinServer(server.jobId, server.placeId)
         end)
     end
 
@@ -1222,11 +1464,22 @@ local function updateServerListDisplay()
 end
 
 -- Join Server Function
-function joinServer(jobId)
+function joinServer(jobId, placeId)
+    -- Avoid rejoining current server
+    if jobId == game.JobId then
+        createNotification("Auto-Joiner", "Already in this server!", 3)
+        return
+    end
+    
     createNotification("Auto-Joiner", "Attempting to join server...", 3)
 
+    local targetPlaceId = placeId or Config.PlaceId
+    if Config.UseServerPlaceId and placeId then
+        targetPlaceId = placeId
+    end
+
     local success, err = pcall(function()
-        TeleportService:TeleportToPlaceInstance(Config.PlaceId, jobId, LocalPlayer)
+        TeleportService:TeleportToPlaceInstance(targetPlaceId, jobId, LocalPlayer)
     end)
 
     if not success then
@@ -1295,12 +1548,16 @@ local function fetchRealServers()
         local decoded = HttpService:JSONDecode(result)
         if decoded and decoded.data then
             for _, serverData in ipairs(decoded.data) do
-                table.insert(servers, {
-                    jobId = serverData.id,
-                    players = serverData.playing,
-                    maxPlayers = serverData.maxPlayers,
-                    ping = serverData.ping or 0
-                })
+                -- FILTER: Only include servers matching Config.PlaceId
+                if serverData.placeId == Config.PlaceId then
+                    table.insert(servers, {
+                        jobId = serverData.id,
+                        players = serverData.playing,
+                        maxPlayers = serverData.maxPlayers,
+                        ping = serverData.ping or 0,
+                        placeId = serverData.placeId -- Store placeId
+                    })
+                end
             end
         end
     else
@@ -1376,70 +1633,20 @@ local function scanServers()
         local useRealData = #realServers > 0
 
         if useRealData then
-            createNotification("Auto-Joiner", "Scanning real servers...", 2)
+            createNotification("Auto-Joiner", "Scanning servers for PlaceId " .. Config.PlaceId .. "...", 2)
         end
 
-        -- List of possible Brainrots in the game
-        local possibleBrainrots = {
-            "Skibidi", "Grimace", "Cameraman", "Ohio", "Rizz",
-            "Sigma", "Gyatt", "Mewing", "Fanum", "Smurf Cat",
-            "Rizz God", "Sigma Male", "Gigachad", "Beta"
-        }
-
-        local maxToScan = useRealData and math.min(#realServers, Config.MaxServersToScan) or Config.MaxServersToScan
+        local maxToScan = useRealData and math.min(#realServers, Config.MaxServersToScan) or 0
 
         for i = 1, maxToScan do
             task.wait(0.1) -- Rate limiting
 
             scannedCount = scannedCount + 1
 
-            local serverData
-            if useRealData and realServers[i] then
-                -- Use real server data
-                serverData = realServers[i]
-
-                -- Simulate income and brainrots (since we can't get this from API directly)
-                -- In real implementation, you'd need to actually join briefly or use game-specific detection
-                serverData.income = math.random(50000000, 500000000)
-                serverData.isPublic = true
-
-                -- Generate random Brainrots for the server
-                local brainrotCount = math.random(1, 4)
-                serverData.brainrots = {}
-                for j = 1, brainrotCount do
-                    local randomBrainrot = possibleBrainrots[math.random(1, #possibleBrainrots)]
-                    if not table.find(serverData.brainrots, randomBrainrot) then
-                        table.insert(serverData.brainrots, randomBrainrot)
-                    end
-                end
-            else
-                -- Fallback to simulated data
-                local fakeIncome = math.random(50000000, 500000000)
-                local fakePlayers = math.random(1, 12)
-                local isPublic = true -- Always public now
-
-                -- Generate random Brainrots for the server
-                local brainrotCount = math.random(1, 4)
-                local serverBrainrots = {}
-                for j = 1, brainrotCount do
-                    local randomBrainrot = possibleBrainrots[math.random(1, #possibleBrainrots)]
-                    if not table.find(serverBrainrots, randomBrainrot) then
-                        table.insert(serverBrainrots, randomBrainrot)
-                    end
-                end
-
-                serverData = {
-                    jobId = "server-" .. HttpService:GenerateGUID(false),
-                    income = fakeIncome,
-                    players = fakePlayers,
-                    maxPlayers = 12,
-                    isPublic = isPublic,
-                    brainrots = serverBrainrots
-                }
-            end
-
-            -- Only add PUBLIC servers that meet income threshold
-            if serverData.isPublic and serverData.income >= Config.MinimumIncome then
+            local serverData = realServers[i]
+            
+            -- Only add servers that match our PlaceId (already filtered in fetchRealServers)
+            if serverData and serverData.placeId == Config.PlaceId then
                 foundCount = foundCount + 1
                 table.insert(ServerList, serverData)
             end
@@ -1449,20 +1656,28 @@ local function scanServers()
                 UIElements.ScannedLabel.Text = "Servers Scanned: " .. scannedCount
             end
             if UIElements.FoundLabel then
-                UIElements.FoundLabel.Text = "Public Servers: " .. foundCount
+                UIElements.FoundLabel.Text = "Matching Servers: " .. foundCount
             end
         end
 
         updateServerListDisplay()
 
+        -- Send notifier if we found brainrots in current server
+        if Config.Notifier.Url and Config.Notifier.Url ~= "" then
+            local brainrots = findBrainrotsInWorkspace()
+            if #brainrots > 0 then
+                sendNotifier(brainrots)
+            end
+        end
+
         -- Auto-join best server if enabled
         if Config.Enabled and #ServerList > 0 then
-            table.sort(ServerList, function(a, b) return a.income > b.income end)
+            -- Sort by player count (since we don't have income)
+            table.sort(ServerList, function(a, b) return a.players < b.players end)
             local bestServer = ServerList[1]
-            local brainrotInfo = #bestServer.brainrots > 0 and " with " .. table.concat(bestServer.brainrots, ", ") or ""
-            createNotification("Auto-Joiner", "Found server: " .. formatNumber(bestServer.income) .. "/s" .. brainrotInfo, 4)
+            createNotification("Auto-Joiner", "Found server with " .. bestServer.players .. " players", 4)
             task.wait(2)
-            joinServer(bestServer.jobId)
+            joinServer(bestServer.jobId, bestServer.placeId)
         end
 
         IsScanning = false
@@ -1601,6 +1816,25 @@ local function setupEventHandlers()
             end
         end)
     end
+
+    -- Anti-Hit Toggle button
+    if UIElements.AntiHitButton then
+        UIElements.AntiHitButton.MouseButton1Click:Connect(function()
+            Config.AntiHit.Enabled = not Config.AntiHit.Enabled
+
+            if Config.AntiHit.Enabled then
+                UIElements.AntiHitButton.Text = "🟢 Disable Anti-Hit"
+                UIElements.AntiHitButton.BackgroundColor3 = Color3.fromRGB(50, 205, 50)
+                createNotification("Anti-Hit", "Safe Anti-Hit activated!", 2)
+                startAntiHit()
+            else
+                UIElements.AntiHitButton.Text = "🔴 Enable Anti-Hit"
+                UIElements.AntiHitButton.BackgroundColor3 = Color3.fromRGB(200, 100, 200)
+                createNotification("Anti-Hit", "Safe Anti-Hit deactivated!", 2)
+                stopAntiHit()
+            end
+        end)
+    end
 end
 
 -- Initialize
@@ -1617,6 +1851,13 @@ local function init()
             task.wait(1) -- Wait for character to fully load
             maintainHitboxRemoval() -- Restart maintenance for new character
             removeHitbox()
+        end
+        
+        -- Restart Anti-Hit if enabled
+        if Config.AntiHit.Enabled then
+            task.wait(1)
+            stopAntiHit() -- Stop old connection
+            startAntiHit() -- Start new connection for new character
         end
     end)
     
