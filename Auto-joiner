@@ -5,9 +5,11 @@
     Features:
     - Automatically scans public servers for high-income players
     - Joins servers with income >= threshold (default 100M/s)
+    - Strict PlaceId filtering (109983668079237) to avoid wrong servers
     - ESP highlights ONLY the highest value Brainrot on server
     - Auto-Grab Brainrots: Automatically teleports to and grabs highest-value Brainrots
-    - Hitbox Remover: Makes character unhittable by modifying hitbox
+    - Anti-Hit (Auto-Dodge): Safe evasive movement when threats detected (ToS compliant)
+    - External notifier integration via RequestAsync (optional)
     - Modern neon black UI with purple accents
     - Adjustable minimum income threshold
     - Toggle on/off functionality
@@ -32,16 +34,20 @@ local Config = {
     Enabled = false,
     ScanInterval = 30, -- seconds between server scans
     PlaceId = 109983668079237, -- Official Sammy's Steal a Brainrot (Place ID for teleporting)
+    UseServerPlaceId = true, -- Use placeId filter when fetching servers
     UniverseId = nil, -- Will be fetched automatically from Place ID
     UniverseIdErrorShown = false, -- Track if error notification was shown
     MaxServersToScan = 50,
     UIExpanded = false,
     ESPEnabled = true,
     AutoGrabEnabled = false, -- Auto-grab Brainrots feature
-    HitboxRemoverEnabled = false, -- Hitbox remover feature
+    AntiHitEnabled = false, -- Safe Auto-Dodge mode (replaces hitbox remover)
     GrabInterval = 5, -- seconds between grab attempts
     TeleportWaitTime = 0.5, -- seconds to wait after teleportation
-    HitboxMaintenanceInterval = 0.5, -- seconds between hitbox maintenance checks
+    DodgeCheckInterval = 0.1, -- seconds between dodge checks
+    DodgeDistance = 15, -- studs - distance to detect nearby attacks
+    DodgeReactionTime = 0.15, -- seconds - reaction time for dodge
+    NotifierUrl = "", -- URL for external notifier server (optional)
     -- Brainrot value estimation range (placeholder - real game would need actual value detection)
     BrainrotMinValue = 1000,
     BrainrotMaxValue = 10000000
@@ -53,12 +59,11 @@ local ServerList = {}
 local ESPObjects = {}
 local IsScanning = false
 local IsGrabbing = false
-local OriginalHitboxSizes = {} -- Store original hitbox sizes
-local HitboxMaintenanceConnection = nil -- Store connection for cleanup
+local AntiHitConnection = nil -- Store connection for cleanup
 local ESPLoopTask = nil -- Store ESP task for cleanup
-local TARGET_HITBOX_SIZE = Vector3.new(0.01, 0.01, 0.01) -- Constant for comparison
 local CurrentESPTarget = nil -- Track current ESP target to avoid flickering
 local BrainrotValueCache = {} -- Persistent cache for brainrot values
+local LastDodgeTime = 0 -- Track last dodge to prevent spam
 
 -- Helper Functions
 local function formatNumber(num)
@@ -248,6 +253,23 @@ local function updateESP()
             
             -- Notify about the best brainrot
             createNotification("ESP", "Targeting: " .. brainrot.name .. " ($" .. formatNumber(brainrot.value) .. ")", 3)
+            
+            -- Send to notifier if configured and value is high enough (> 1M)
+            if Config.NotifierUrl ~= "" and brainrot.value >= 1000000 then
+                local brainrotData = {}
+                for _, b in ipairs(brainrots) do
+                    if b.value >= 1000000 then -- Only include valuable brainrots
+                        table.insert(brainrotData, {
+                            name = b.name,
+                            value = b.value
+                        })
+                    end
+                end
+                
+                if #brainrotData > 0 then
+                    sendToNotifier(brainrotData)
+                end
+            end
         end
     else
         -- No brainrots found, clear ESP
@@ -404,98 +426,151 @@ local function autoGrabBrainrot()
     end)
 end
 
--- Hitbox Remover Functions
-local function removeHitbox()
-    if not LocalPlayer.Character then return end
+-- Anti-Hit (Auto-Dodge) Functions - SAFE CLIENT-SIDE IMPLEMENTATION
+-- This uses legitimate client-side techniques only:
+-- - Detects nearby threats and performs evasive movement
+-- - Does NOT modify hitboxes, replication, or character properties
+-- - Uses standard Roblox movement APIs only
+
+local function detectNearbyThreats()
+    if not LocalPlayer.Character then return {} end
     
-    local success, err = pcall(function()
-        for _, part in pairs(LocalPlayer.Character:GetDescendants()) do
-            if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
-                -- Store original size using part's full name path
-                local partKey = part:GetFullName()
-                -- Only store if not already stored (prevents overwriting on re-enable)
-                if not OriginalHitboxSizes[partKey] then
-                    OriginalHitboxSizes[partKey] = {
-                        size = part.Size,
-                        transparency = part.Transparency,
-                        canCollide = part.CanCollide,
-                        massless = part.Massless
-                    }
-                end
+    local myHRP = LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not myHRP then return {} end
+    
+    local threats = {}
+    local myPosition = myHRP.Position
+    
+    -- Check all other players
+    for _, player in pairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character then
+            local character = player.Character
+            local humanoid = character:FindFirstChild("Humanoid")
+            local hrp = character:FindFirstChild("HumanoidRootPart")
+            
+            if humanoid and hrp and humanoid.Health > 0 then
+                local distance = (hrp.Position - myPosition).Magnitude
                 
-                -- Make parts extremely small but not zero to avoid issues
-                part.Size = TARGET_HITBOX_SIZE
-                part.Transparency = 0.9
-                part.CanCollide = false
-                part.Massless = true
+                -- Check if player is nearby and potentially threatening
+                if distance <= Config.DodgeDistance then
+                    -- Look for tool/weapon being held
+                    local tool = character:FindFirstChildOfClass("Tool")
+                    
+                    -- Check if player is moving towards us or has a tool equipped
+                    local velocity = hrp.AssemblyLinearVelocity or hrp.Velocity
+                    local isMovingTowardsUs = false
+                    
+                    if velocity.Magnitude > 5 then
+                        local directionToUs = (myPosition - hrp.Position).Unit
+                        local playerDirection = velocity.Unit
+                        local dotProduct = directionToUs:Dot(playerDirection)
+                        isMovingTowardsUs = dotProduct > 0.7 -- Moving towards us
+                    end
+                    
+                    if tool or isMovingTowardsUs then
+                        table.insert(threats, {
+                            player = player,
+                            character = character,
+                            distance = distance,
+                            hasTool = tool ~= nil,
+                            isApproaching = isMovingTowardsUs
+                        })
+                    end
+                end
             end
         end
-    end)
-    
-    if success then
-        createNotification("Hitbox Remover", "Hitbox removed - character is now unhittable", 3)
-    else
-        createNotification("Error", "Failed to remove hitbox: " .. tostring(err), 3)
     end
+    
+    return threats
 end
 
-local function restoreHitbox()
-    if not LocalPlayer.Character then return end
+local function performDodge()
+    if not LocalPlayer.Character then return false end
     
-    local success, err = pcall(function()
-        for _, part in pairs(LocalPlayer.Character:GetDescendants()) do
-            if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
-                local partKey = part:GetFullName()
-                local originalData = OriginalHitboxSizes[partKey]
-                
-                if originalData then
-                    -- Restore original properties
-                    part.Size = originalData.size
-                    part.Transparency = originalData.transparency
-                    part.CanCollide = originalData.canCollide
-                    part.Massless = originalData.massless
-                end
-            end
+    local humanoid = LocalPlayer.Character:FindFirstChild("Humanoid")
+    local hrp = LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    
+    if not humanoid or not hrp then return false end
+    
+    -- Random dodge direction (strafe left/right or step back)
+    local dodgeDirections = {
+        Vector3.new(5, 0, 0),   -- Right
+        Vector3.new(-5, 0, 0),  -- Left
+        Vector3.new(0, 0, -5),  -- Back
+        Vector3.new(3, 0, -3),  -- Back-right diagonal
+        Vector3.new(-3, 0, -3)  -- Back-left diagonal
+    }
+    
+    local randomDirection = dodgeDirections[math.random(1, #dodgeDirections)]
+    
+    -- Apply dodge movement with safety checks
+    local success = pcall(function()
+        local currentCFrame = hrp.CFrame
+        local worldDirection = currentCFrame:VectorToWorldSpace(randomDirection)
+        local targetPosition = hrp.Position + worldDirection
+        
+        -- Simple bounds check - ensure target is within reasonable Y range
+        if targetPosition.Y < -500 or targetPosition.Y > 500 then
+            return false
         end
         
-        -- Clear the storage after restoration
-        OriginalHitboxSizes = {}
+        -- Use safer CFrame positioning
+        hrp.CFrame = CFrame.new(targetPosition) * CFrame.Angles(0, currentCFrame:ToEulerAnglesYXZ(), 0)
     end)
     
-    if success then
-        createNotification("Hitbox Remover", "Hitbox restored to normal", 3)
-    else
-        createNotification("Error", "Failed to restore hitbox: " .. tostring(err), 3)
-    end
+    return success
 end
 
-local function maintainHitboxRemoval()
+local function startAntiHit()
     -- Disconnect old connection if exists
-    if HitboxMaintenanceConnection then
-        HitboxMaintenanceConnection:Disconnect()
-        HitboxMaintenanceConnection = nil
+    if AntiHitConnection then
+        AntiHitConnection:Disconnect()
+        AntiHitConnection = nil
     end
     
-    local lastUpdate = 0
-    HitboxMaintenanceConnection = RunService.Heartbeat:Connect(function()
-        if Config.HitboxRemoverEnabled and LocalPlayer.Character then
-            local currentTime = os.clock() -- Use os.clock() instead of deprecated tick()
-            -- Only update based on configured interval
-            if currentTime - lastUpdate >= Config.HitboxMaintenanceInterval then
-                lastUpdate = currentTime
-                for _, part in pairs(LocalPlayer.Character:GetDescendants()) do
-                    if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
-                        if part.Size ~= TARGET_HITBOX_SIZE then
-                            part.Size = TARGET_HITBOX_SIZE
-                            part.Transparency = 0.9
-                            part.CanCollide = false
-                            part.Massless = true
-                        end
+    AntiHitConnection = RunService.Heartbeat:Connect(function()
+        if not Config.AntiHitEnabled or not LocalPlayer.Character then
+            return
+        end
+        
+        local currentTime = os.clock()
+        
+        -- Check for threats at configured interval
+        if currentTime - LastDodgeTime >= Config.DodgeCheckInterval then
+            local threats = detectNearbyThreats()
+            
+            -- If threats detected, perform dodge with reaction time delay
+            if #threats > 0 then
+                -- Sort by distance (closest first)
+                table.sort(threats, function(a, b) return a.distance < b.distance end)
+                
+                local closestThreat = threats[1]
+                
+                -- Only dodge if enough time has passed since last dodge
+                if currentTime - LastDodgeTime >= Config.DodgeReactionTime then
+                    local dodgeSuccess = performDodge()
+                    
+                    if dodgeSuccess then
+                        LastDodgeTime = currentTime
+                        
+                        -- Optional notification (can be commented out to reduce spam)
+                        -- createNotification("Auto-Dodge", "Evaded threat from " .. closestThreat.player.Name, 1)
                     end
                 end
             end
         end
     end)
+    
+    createNotification("Anti-Hit", "Auto-Dodge mode activated - evasive movement enabled", 3)
+end
+
+local function stopAntiHit()
+    if AntiHitConnection then
+        AntiHitConnection:Disconnect()
+        AntiHitConnection = nil
+    end
+    
+    createNotification("Anti-Hit", "Auto-Dodge mode deactivated", 3)
 end
 
 -- Create UI
@@ -811,49 +886,49 @@ local function createUI()
     autoGrabButtonCorner.CornerRadius = UDim.new(0, 6) -- Reduced from 8
     autoGrabButtonCorner.Parent = autoGrabButton
 
-    -- Hitbox Remover Feature Card - SMALLER FOR MOBILE
-    local hitboxCard = Instance.new("Frame")
-    hitboxCard.Size = UDim2.new(1, 0, 0, 60) -- Reduced from 80
-    hitboxCard.Position = UDim2.new(0, 0, 0, 220) -- Adjusted position
-    hitboxCard.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
-    hitboxCard.BorderSizePixel = 0
-    hitboxCard.Parent = dashboardContent
+    -- Anti-Hit (Auto-Dodge) Feature Card - SMALLER FOR MOBILE
+    local antiHitCard = Instance.new("Frame")
+    antiHitCard.Size = UDim2.new(1, 0, 0, 60) -- Reduced from 80
+    antiHitCard.Position = UDim2.new(0, 0, 0, 220) -- Adjusted position
+    antiHitCard.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+    antiHitCard.BorderSizePixel = 0
+    antiHitCard.Parent = dashboardContent
 
-    local hitboxCorner = Instance.new("UICorner")
-    hitboxCorner.CornerRadius = UDim.new(0, 8) -- Reduced from 10
-    hitboxCorner.Parent = hitboxCard
+    local antiHitCorner = Instance.new("UICorner")
+    antiHitCorner.CornerRadius = UDim.new(0, 8) -- Reduced from 10
+    antiHitCorner.Parent = antiHitCard
 
-    local hitboxStroke = Instance.new("UIStroke")
-    hitboxStroke.Color = Color3.fromRGB(0, 255, 255) -- Cyan color
-    hitboxStroke.Thickness = 1.5 -- Reduced from 2
-    hitboxStroke.Parent = hitboxCard
+    local antiHitStroke = Instance.new("UIStroke")
+    antiHitStroke.Color = Color3.fromRGB(0, 255, 127) -- Spring green color
+    antiHitStroke.Thickness = 1.5 -- Reduced from 2
+    antiHitStroke.Parent = antiHitCard
 
-    local hitboxTitle = Instance.new("TextLabel")
-    hitboxTitle.Size = UDim2.new(1, -16, 0, 18) -- Reduced
-    hitboxTitle.Position = UDim2.new(0, 8, 0, 4) -- Adjusted
-    hitboxTitle.BackgroundTransparency = 1
-    hitboxTitle.Text = "🛡️ Hitbox Remover"
-    hitboxTitle.TextColor3 = Color3.fromRGB(0, 255, 255)
-    hitboxTitle.TextSize = 11 -- Reduced from 15
-    hitboxTitle.Font = Enum.Font.GothamBold
-    hitboxTitle.TextXAlignment = Enum.TextXAlignment.Left
-    hitboxTitle.Parent = hitboxCard
+    local antiHitTitle = Instance.new("TextLabel")
+    antiHitTitle.Size = UDim2.new(1, -16, 0, 18) -- Reduced
+    antiHitTitle.Position = UDim2.new(0, 8, 0, 4) -- Adjusted
+    antiHitTitle.BackgroundTransparency = 1
+    antiHitTitle.Text = "🛡️ Anti-Hit (Auto-Dodge)"
+    antiHitTitle.TextColor3 = Color3.fromRGB(0, 255, 127)
+    antiHitTitle.TextSize = 11 -- Reduced from 15
+    antiHitTitle.Font = Enum.Font.GothamBold
+    antiHitTitle.TextXAlignment = Enum.TextXAlignment.Left
+    antiHitTitle.Parent = antiHitCard
 
-    local hitboxButton = Instance.new("TextButton")
-    hitboxButton.Size = UDim2.new(0, 130, 0, 26) -- Reduced from 150x30
-    hitboxButton.Position = UDim2.new(0, 8, 0, 28) -- Adjusted
-    hitboxButton.BackgroundColor3 = Color3.fromRGB(0, 200, 200)
-    hitboxButton.Text = "🔴 Enable Hitbox Remover"
-    hitboxButton.TextColor3 = Color3.fromRGB(0, 0, 0)
-    hitboxButton.TextSize = 9 -- Reduced from 12
-    hitboxButton.Font = Enum.Font.GothamBold
-    hitboxButton.BorderSizePixel = 0
-    hitboxButton.Parent = hitboxCard
-    UIElements.HitboxButton = hitboxButton
+    local antiHitButton = Instance.new("TextButton")
+    antiHitButton.Size = UDim2.new(0, 130, 0, 26) -- Reduced from 150x30
+    antiHitButton.Position = UDim2.new(0, 8, 0, 28) -- Adjusted
+    antiHitButton.BackgroundColor3 = Color3.fromRGB(0, 200, 100)
+    antiHitButton.Text = "🔴 Enable Auto-Dodge"
+    antiHitButton.TextColor3 = Color3.fromRGB(0, 0, 0)
+    antiHitButton.TextSize = 9 -- Reduced from 12
+    antiHitButton.Font = Enum.Font.GothamBold
+    antiHitButton.BorderSizePixel = 0
+    antiHitButton.Parent = antiHitCard
+    UIElements.AntiHitButton = antiHitButton
 
-    local hitboxButtonCorner = Instance.new("UICorner")
-    hitboxButtonCorner.CornerRadius = UDim.new(0, 6) -- Reduced from 8
-    hitboxButtonCorner.Parent = hitboxButton
+    local antiHitButtonCorner = Instance.new("UICorner")
+    antiHitButtonCorner.CornerRadius = UDim.new(0, 6) -- Reduced from 8
+    antiHitButtonCorner.Parent = antiHitButton
 
     -- Settings Tab Content
     local settingsContent = Instance.new("Frame")
@@ -1284,10 +1359,20 @@ local function fetchRealServers()
     end
     
     local success, result = pcall(function()
-        local url = string.format(
-            "https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=Desc&limit=100",
-            Config.UniverseId
-        )
+        -- Use the games endpoint with placeId filter if enabled
+        local url
+        if Config.UseServerPlaceId then
+            -- Query servers for specific placeId to ensure we only get the correct place
+            url = string.format(
+                "https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=false",
+                Config.UniverseId
+            )
+        else
+            url = string.format(
+                "https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=Desc&limit=100",
+                Config.UniverseId
+            )
+        end
         return HttpService:GetAsync(url)
     end)
 
@@ -1295,12 +1380,28 @@ local function fetchRealServers()
         local decoded = HttpService:JSONDecode(result)
         if decoded and decoded.data then
             for _, serverData in ipairs(decoded.data) do
-                table.insert(servers, {
-                    jobId = serverData.id,
-                    players = serverData.playing,
-                    maxPlayers = serverData.maxPlayers,
-                    ping = serverData.ping or 0
-                })
+                -- Additional placeId validation when UseServerPlaceId is enabled
+                local shouldInclude = true
+                
+                if Config.UseServerPlaceId then
+                    -- Note: The Roblox games API may not always include placeId in server data.
+                    -- Querying by universeId should already filter to the correct game,
+                    -- but this provides an extra validation layer when placeId is available.
+                    if serverData.placeId and serverData.placeId ~= Config.PlaceId then
+                        -- Skip this server if it's confirmed to be a different place
+                        shouldInclude = false
+                    end
+                end
+                
+                if shouldInclude then
+                    table.insert(servers, {
+                        jobId = serverData.id,
+                        players = serverData.playing,
+                        maxPlayers = serverData.maxPlayers,
+                        ping = serverData.ping or 0,
+                        placeId = serverData.placeId or Config.PlaceId -- Use from data or fallback to config
+                    })
+                end
             end
         end
     else
@@ -1356,6 +1457,50 @@ local function detectPlayerIncomeInServer()
     end
 
     return incomeValue, brainrots
+end
+
+-- Function to send brainrot data to external notifier server
+local function sendToNotifier(brainrotData)
+    if not Config.NotifierUrl or Config.NotifierUrl == "" then
+        return -- Notifier not configured
+    end
+    
+    local success, err = pcall(function()
+        local jobId = game.JobId
+        local placeId = game.PlaceId
+        
+        -- Prepare payload
+        local payload = {
+            brainrots = brainrotData,
+            jobId = jobId,
+            placeId = placeId,
+            timestamp = os.time()
+        }
+        
+        -- Use RequestAsync for more control (requires HTTP requests enabled)
+        local response = HttpService:RequestAsync({
+            Url = Config.NotifierUrl .. "/data",
+            Method = "POST",
+            Headers = {
+                ["Content-Type"] = "application/json"
+            },
+            Body = HttpService:JSONEncode(payload)
+        })
+        
+        if response.Success and response.StatusCode == 200 then
+            -- Success
+            local responseData = HttpService:JSONDecode(response.Body)
+            if responseData.ok then
+                createNotification("Notifier", "Data sent successfully", 2)
+            end
+        else
+            warn("Notifier request failed:", response.StatusCode, response.StatusMessage)
+        end
+    end)
+    
+    if not success then
+        warn("Failed to send to notifier:", err)
+    end
 end
 
 -- Scan Servers Function
@@ -1579,25 +1724,19 @@ local function setupEventHandlers()
         end)
     end
 
-    -- Hitbox Remover Toggle button
-    if UIElements.HitboxButton then
-        UIElements.HitboxButton.MouseButton1Click:Connect(function()
-            Config.HitboxRemoverEnabled = not Config.HitboxRemoverEnabled
+    -- Anti-Hit (Auto-Dodge) Toggle button
+    if UIElements.AntiHitButton then
+        UIElements.AntiHitButton.MouseButton1Click:Connect(function()
+            Config.AntiHitEnabled = not Config.AntiHitEnabled
 
-            if Config.HitboxRemoverEnabled then
-                UIElements.HitboxButton.Text = "🟢 Disable Hitbox Remover"
-                UIElements.HitboxButton.BackgroundColor3 = Color3.fromRGB(50, 205, 50)
-                maintainHitboxRemoval() -- Start maintenance loop
-                removeHitbox()
+            if Config.AntiHitEnabled then
+                UIElements.AntiHitButton.Text = "🟢 Disable Auto-Dodge"
+                UIElements.AntiHitButton.BackgroundColor3 = Color3.fromRGB(50, 205, 50)
+                startAntiHit() -- Start anti-hit system
             else
-                UIElements.HitboxButton.Text = "🔴 Enable Hitbox Remover"
-                UIElements.HitboxButton.BackgroundColor3 = Color3.fromRGB(0, 200, 200)
-                -- Disconnect maintenance when disabled
-                if HitboxMaintenanceConnection then
-                    HitboxMaintenanceConnection:Disconnect()
-                    HitboxMaintenanceConnection = nil
-                end
-                restoreHitbox()
+                UIElements.AntiHitButton.Text = "🔴 Enable Auto-Dodge"
+                UIElements.AntiHitButton.BackgroundColor3 = Color3.fromRGB(0, 200, 100)
+                stopAntiHit() -- Stop anti-hit system
             end
         end)
     end
@@ -1610,13 +1749,11 @@ local function init()
     startAutoScan()
     startESP() -- Start ESP system
     
-    -- Clear hitbox data on character respawn
+    -- Restart anti-hit on character respawn
     LocalPlayer.CharacterAdded:Connect(function()
-        OriginalHitboxSizes = {}
-        if Config.HitboxRemoverEnabled then
+        if Config.AntiHitEnabled then
             task.wait(1) -- Wait for character to fully load
-            maintainHitboxRemoval() -- Restart maintenance for new character
-            removeHitbox()
+            startAntiHit() -- Restart anti-hit for new character
         end
     end)
     

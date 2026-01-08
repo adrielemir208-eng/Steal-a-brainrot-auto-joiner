@@ -4,13 +4,19 @@ import fetch from "node-fetch";
 const app = express();
 app.use(express.json());
 
-// Webhooks distintos según rango
-const WEBHOOK_LOW = "https://discord.com/api/webhooks/1458754029818744833/aM98FXJ9Yksoo1FNamrLJfOhXT2Eefcfw2tvA36m-OM1G3SmbQl4Urid185Tu2S-xzSV";   // 1–10 millones
-const WEBHOOK_HIGH = "https://discord.com/api/webhooks/1458754235884765267/HwFdHLzFSNGjnrSCIOD3XkE66BtV3NjO90rLLgedRXmULZ2l6YNcAI2PVYUaWAlW7I3V";  // >10 millones
+// Environment variables for production deployment (Render)
+const WEBHOOK_LOW = process.env.WEBHOOK_LOW || "";   // 1–10 millones
+const WEBHOOK_HIGH = process.env.WEBHOOK_HIGH || "";  // >10 millones
+const PORT = process.env.PORT || 3000;
+const NODE_ENV = process.env.NODE_ENV || "development";
 
 // Guardar últimas notificaciones
 let lastLowNotification = null;
 let lastHighNotification = null;
+
+// Statistics for debug
+let requestCount = 0;
+let lastRequestTime = null;
 
 // Función para construir y enviar embed
 async function sendEmbed(brainrots, payload, webhookUrl) {
@@ -67,7 +73,19 @@ async function sendEmbed(brainrots, payload, webhookUrl) {
 // Endpoint que recibe datos desde Roblox
 app.post("/data", async (req, res) => {
   try {
+    requestCount++;
+    lastRequestTime = new Date().toISOString();
+    
     const payload = req.body;
+
+    // Validate payload
+    if (!payload || !payload.brainrots || !Array.isArray(payload.brainrots)) {
+      return res.status(400).json({ ok: false, error: "Invalid payload: brainrots array required" });
+    }
+
+    if (NODE_ENV === "development") {
+      console.log("Received payload with", payload.brainrots?.length || 0, "brainrot(s)");
+    }
 
     // Separar brainrots por rango
     const lowBrainrots = payload.brainrots.filter(b => b.value >= 1e6 && b.value <= 1e7);
@@ -97,8 +115,46 @@ app.get("/notifications/low", (req, res) => {
   res.json(lastLowNotification || {});
 });
 
+// Debug endpoints
+app.get("/health", (req, res) => {
+  res.json({ 
+    status: "ok", 
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get("/status", (req, res) => {
+  res.json({
+    status: "ok",
+    environment: NODE_ENV,
+    requestCount,
+    lastRequestTime,
+    lastHighNotification,
+    lastLowNotification,
+    webhooks: {
+      low: WEBHOOK_LOW ? "configured" : "not configured",
+      high: WEBHOOK_HIGH ? "configured" : "not configured"
+    }
+  });
+});
+
+// Root endpoint
+app.get("/", (req, res) => {
+  res.json({
+    service: "Steal-a-Brainrot Notifier",
+    version: "1.0.0",
+    endpoints: {
+      POST: ["/data"],
+      GET: ["/health", "/status", "/notifications/high", "/notifications/low"]
+    }
+  });
+});
+
 // Render necesita escuchar en el puerto asignado
-const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Servidor escuchando en puerto ${PORT}`);
+  console.log(`Modo: ${NODE_ENV}`);
+  console.log(`Webhook LOW: ${WEBHOOK_LOW ? "configurado" : "no configurado"}`);
+  console.log(`Webhook HIGH: ${WEBHOOK_HIGH ? "configurado" : "no configurado"}`);
 });
