@@ -57,4 +57,24 @@ app.get("/notifications/high", (req, res) => res.json(lastHighNotification || {}
 app.get("/notifications/low", (req, res) => res.json(lastLowNotification || {}));
 
 const PORT = process.env.PORT || 3000;
+app.get("/", (req, res) => {
+    res.json({
+        ok: true,
+        message: "Echos Finder Notifier is online"
+    });
+});
+
+app.get("/health", (req, res) => {
+    res.json({
+        ok: true,
+        status: "healthy"
+    });
+});
+
+app.get("/status", (req, res) => {
+    res.json({
+        ok: true,
+        uptime: process.uptime()
+    });
+});
 app.listen(PORT, () => { console.log(`Desplegado ${PORT}`); });
